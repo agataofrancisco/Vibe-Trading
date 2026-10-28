@@ -71,6 +71,7 @@ def _mandate(
     *,
     max_order=1_000_000.0,
     max_trades=100,
+    daily_loss=0.0,
     assets=(AssetClass.US_EQUITY,),
     instruments=(InstrumentType.EQUITY,),
 ):
@@ -83,6 +84,7 @@ def _mandate(
             max_leverage=2.0,
             allowed_instruments=tuple(instruments),
             max_trades_per_day=max_trades,
+            max_daily_loss_pct=daily_loss,
         ),
         universe=UniverseConstraint(
             asset_classes=tuple(assets),
@@ -106,6 +108,7 @@ def _patch_gate(monkeypatch, *, mandate, halted=False):
     monkeypatch.setattr(gate, "write_live_action", lambda *a, **k: {"audited": True})
     monkeypatch.setattr(gate, "read_daily_count", lambda broker: 0)
     monkeypatch.setattr(gate, "increment_daily_count", lambda broker: 1)
+    monkeypatch.setattr(gate, "ensure_daily_start_equity", lambda broker, equity: None)
     monkeypatch.setattr(gate, "daily_order_lock", lambda broker: nullcontext())
 
 
@@ -155,6 +158,47 @@ def test_gate_allows_in_bounds_and_places(monkeypatch) -> None:
     assert out["status"] == "ok" and out["order_id"] == "OID-1"
     assert len(conn.placed) == 1  # forwarded to broker
     assert "live_action" in out
+
+
+def test_gate_anchors_daily_equity_from_nested_connector_envelope(monkeypatch) -> None:
+    """MT5 nests equity under ``account``; the gate must still find it."""
+    _patch_gate(monkeypatch, mandate=_mandate())
+    seen: dict[str, object] = {}
+
+    def _anchor(broker, equity):
+        seen["broker"] = broker
+        seen["equity"] = equity
+        return equity
+
+    monkeypatch.setattr(gate, "ensure_daily_start_equity", _anchor)
+    conn = _FakeConnector(
+        balance={"status": "ok", "account": {"equity": 12_345.0}}
+    )
+    gate.execute_live_order(
+        broker="alpaca", connector_module=conn, config=object(),
+        intent=_intent(notional=500.0), place_kwargs={"symbol": "AAPL", "side": "buy", "notional": 500.0},
+    )
+    assert seen == {"broker": "alpaca", "equity": 12_345.0}
+
+
+def test_gate_blocks_when_daily_loss_stop_is_hit(monkeypatch) -> None:
+    _patch_gate(monkeypatch, mandate=_mandate(daily_loss=0.05))
+    monkeypatch.setattr(
+        gate, "ensure_daily_start_equity", lambda broker, equity: 10_000.0
+    )
+    conn = _FakeConnector(
+        balance={"status": "ok", "account": {"equity": 9_000.0}}
+    )
+    out = gate.execute_live_order(
+        broker="alpaca", connector_module=conn, config=object(),
+        intent=_intent(notional=500.0), place_kwargs={"symbol": "AAPL", "side": "buy", "notional": 500.0},
+    )
+    assert out["status"] == "blocked"
+    assert out["breach"]["limit"] == "max_daily_loss_pct"
+    # The daily stop is a plain DENY for the rest of the day, not a widen-prompt.
+    assert out["decision"] == "deny"
+    assert out["requires_reauthorization"] is False
+    assert conn.placed == []
 
 
 def test_gate_blocks_oversized_order(monkeypatch) -> None:

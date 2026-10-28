@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.trading.profiles import list_profiles, profile_by_id
+from src.trading.profiles import list_profiles, load_selected_profile_id, profile_by_id
 from src.trading.types import TradingProfile
 
 RUNNER_CAPABILITY = "runner.manage.requires_mandate"
+
+#: Direct-SDK connectors that can back the managed live runner. The runner
+#: reaches them through :mod:`src.live.sdk_adapter` instead of an MCP server.
+#: A connector only becomes runner-capable once its live profile declares the
+#: ``runner.manage.requires_mandate`` capability.
+DIRECT_SDK_RUNNER_CONNECTORS = frozenset({"mt5"})
 
 #: Direct-SDK connectors (``broker_sdk`` transport) → their connector module.
 #: Each module exposes a uniform read interface (``build_config``, ``check_status``,
@@ -372,23 +378,62 @@ def _audit_live_cancel(profile, order_id, symbol, result, session_id) -> None:
 
 
 def profile_supports_live_runner(profile: TradingProfile) -> bool:
-    """Return whether a profile can run the managed live runner."""
+    """Return whether a profile can run the managed live runner.
+
+    Two transports qualify:
+
+    * ``remote_mcp`` - the runner talks to the broker's MCP server.
+    * ``broker_sdk`` - the runner talks to the connector's SDK directly
+      (see :mod:`src.live.sdk_adapter`). MT5 is the first such connector.
+
+    Either way the profile must declare the ``runner.manage.requires_mandate``
+    capability: the runner places orders autonomously, so it may only run
+    behind a committed mandate and the kill switch.
+
+    A ``paper`` (demo) profile may also back the runner. The mandate caps are
+    what bound the autonomy, and a direct-SDK connector re-verifies the
+    demo/real discriminator on every session, so a paper profile can never
+    reach a real-money account.
+    """
     return (
-        profile.environment == "live"
-        and profile.transport == "remote_mcp"
+        profile.transport in ("remote_mcp", "broker_sdk")
+        and profile.environment in ("live", "paper")
         and RUNNER_CAPABILITY in profile.capabilities
     )
 
 
 def live_runner_profile_for_broker(broker: str) -> TradingProfile | None:
-    """Return the live-runner profile for a broker, if one exists."""
+    """Return the live-runner profile for a broker, if one exists.
+
+    The operator's selected profile wins when it belongs to this broker and
+    is runner-capable - that is how the demo/live choice is made for a
+    connector that ships both (e.g. ``mt5-paper-trade`` vs ``mt5-live-trade``).
+    Otherwise the first runner-capable profile for the broker is used.
+
+    Args:
+        broker: Broker key.
+
+    Returns:
+        The chosen profile, or ``None`` when the broker has none.
+    """
     key = str(broker or "").strip().lower()
     if not key:
         return None
-    for profile in list_profiles():
-        if profile.connector == key and profile_supports_live_runner(profile):
+    candidates = [
+        profile
+        for profile in list_profiles()
+        if profile.connector == key and profile_supports_live_runner(profile)
+    ]
+    if not candidates:
+        return None
+    try:
+        selected = load_selected_profile_id()
+    except Exception:  # noqa: BLE001 - selection is a convenience, not a gate
+        selected = ""
+    for profile in candidates:
+        if profile.id == selected:
             return profile
-    return None
+    return candidates[0]
 
 
 def broker_supports_live_runner(broker: str) -> bool:
@@ -412,11 +457,28 @@ def connector_profile_id_for_broker(broker: str) -> str:
 
 
 def runner_tool_name(connector: str, operation: str) -> str | None:
-    """Map a runner operation to a connector-specific remote MCP tool name."""
+    """Map a runner operation to a connector-specific remote MCP tool name.
+
+    Robinhood is a remote-MCP broker and names its own tools. Direct-SDK
+    connectors (MT5) expose the generic service-layer names instead, via
+    :data:`src.live.sdk_adapter.SDK_RUNNER_TOOLS`.
+
+    Args:
+        connector: Connector key, e.g. ``"robinhood"`` or ``"mt5"``.
+        operation: Runner operation (``positions``, ``account``, ``orders``,
+            ``submit_order``, ``cancel_order``).
+
+    Returns:
+        The tool name, or ``None`` when the connector does not support it.
+    """
     if connector == "robinhood":
         from src.trading.connectors.robinhood.mcp import runner_tool_name as _runner_tool_name
 
         return _runner_tool_name(operation)
+    if connector in DIRECT_SDK_RUNNER_CONNECTORS:
+        from src.live.sdk_adapter import SDK_RUNNER_TOOLS
+
+        return SDK_RUNNER_TOOLS.get(operation)
     return None
 
 

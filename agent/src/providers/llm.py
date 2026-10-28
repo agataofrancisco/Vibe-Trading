@@ -53,6 +53,17 @@ if ChatOpenAI is not None:
             self, *args: Any, vibe_provider: str | None = None, **kwargs: Any
         ) -> None:
             """Initialize while retaining the resolved provider name."""
+            # This adapter's request/response handling (reasoning re-injection,
+            # tool-call round-trip, ``_get_request_payload``) targets the
+            # chat-completions wire format. Newer langchain-openai releases
+            # route some models (e.g. the gpt-5.6 family) through the
+            # Responses API, whose payload shape differs. Keep the
+            # chat-completions contract unless the caller opts in explicitly.
+            if (
+                "use_responses_api" not in kwargs
+                and "use_responses_api" in type(self).model_fields
+            ):
+                kwargs["use_responses_api"] = False
             super().__init__(*args, **kwargs)
             self._vibe_provider = vibe_provider
 
@@ -285,9 +296,17 @@ if ChatOpenAI is not None:
             is absent, breaking ReAct continuations after a tool call (#39).
             """
             payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-            messages = super()._convert_input(input_).to_messages()
             caps = self._capabilities()
-            for i, m in enumerate(payload["messages"]):
+            wire_messages = payload.get("messages")
+            if not isinstance(wire_messages, list):
+                # Newer langchain-openai versions route some models (e.g. the
+                # gpt-5.6 family) through the Responses API, whose payload
+                # carries the conversation under "input" instead of "messages".
+                # The re-injection below targets the chat-completions wire
+                # shape, so skip it rather than raising KeyError.
+                return payload
+            messages = super()._convert_input(input_).to_messages()
+            for i, m in enumerate(wire_messages):
                 if m.get("role") != "assistant":
                     continue
                 source_message = messages[i]
@@ -933,6 +952,12 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         ),
         "vibe_provider": provider,
     }
+    # Optional output-token ceiling. Some gateways (and free tiers) bill
+    # against the requested ceiling instead of the actual usage, so an unset
+    # value can be rejected with HTTP 402 even for an affordable prompt.
+    max_tokens = get_env_config().llm.langchain_max_tokens
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
     if caps.default_headers:
         headers = dict(caps.default_headers)
         if caps.name in {"moonshot", "kimi-coding"}:

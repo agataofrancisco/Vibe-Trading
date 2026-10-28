@@ -9,13 +9,19 @@ import {
   Clock3,
   Loader2,
   OctagonX,
+  Play,
   RefreshCw,
   ShieldCheck,
   ShieldOff,
+  Square,
+  TrendingDown,
+  TrendingUp,
+  Wallet,
   Wifi,
   WifiOff,
 } from "lucide-react";
 import { api, type LiveBrokerStatus, type LiveMandateLimits, type LiveStatus } from "@/lib/api";
+import type { LiveTradingSnapshot } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const RUNTIME_POLL_INTERVAL_MS = 15_000;
@@ -300,8 +306,13 @@ function SdkBrokerRuntimeCard({ broker, t, onRefresh }: { broker: LiveBrokerStat
   const auth = broker.auth;
   const [verifying, setVerifying] = useState(false);
   const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [runnerBusy, setRunnerBusy] = useState(false);
+  const [runnerError, setRunnerError] = useState<string | null>(null);
   const profileId = auth.profile_id || `${auth.broker}-live-sdk-readonly`;
   const state = connectorState(auth, t);
+  const runnerAlive = broker.runner?.alive ?? false;
+  const runnerSupported = broker.runner_supported ?? false;
+  const trading = broker.trading ?? null;
 
   const verify = useCallback(async () => {
     if (verifying) return;
@@ -317,30 +328,88 @@ function SdkBrokerRuntimeCard({ broker, t, onRefresh }: { broker: LiveBrokerStat
     }
   }, [onRefresh, profileId, t, verifying]);
 
+  // The on/off switch the operator asked for: start or stop the autonomous
+  // runner for this broker. It is a privileged surface action (never a chat
+  // message), and it refuses to start without a committed mandate.
+  const toggleRunner = useCallback(async () => {
+    if (runnerBusy) return;
+    setRunnerBusy(true);
+    setRunnerError(null);
+    try {
+      if (runnerAlive) {
+        await api.stopLiveRunner(auth.broker);
+      } else {
+        await api.startLiveRunner(auth.broker);
+      }
+      await onRefresh();
+    } catch (err) {
+      setRunnerError(err instanceof Error ? err.message : t("runtime.runnerControlFailed"));
+    } finally {
+      setRunnerBusy(false);
+    }
+  }, [auth.broker, onRefresh, runnerAlive, runnerBusy, t]);
+
   return (
     <article className="rounded-xl border border-border/60 bg-card p-4 shadow-sm">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-sm font-semibold capitalize">{auth.broker}</h2>
+            <h2 className="text-sm font-semibold">{formatBrokerName(auth.broker)}</h2>
             <StatusPill label={state.label} tone={state.tone} />
+            {runnerSupported ? (
+              <StatusPill
+                label={runnerAlive ? t("runtime.runnerAlive") : t("runtime.runnerStopped")}
+                tone={runnerAlive ? "success" : "neutral"}
+              />
+            ) : null}
           </div>
           {isReadOnlyCompatible(auth) ? (
             <p className="mt-2 text-sm text-muted-foreground">{t("runtime.sdkConnectorProfile")}</p>
           ) : null}
         </div>
-        {state.action ? (
-          <button
-            type="button"
-            onClick={verify}
-            disabled={verifying}
-            className="inline-flex items-center gap-2 rounded-md border border-border/60 px-4 py-2 text-sm font-medium transition hover:bg-muted/60 disabled:opacity-50"
-          >
-            {verifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-            {t(state.action)}
-          </button>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-2">
+          {runnerSupported ? (
+            <button
+              type="button"
+              onClick={toggleRunner}
+              disabled={runnerBusy}
+              className={cn(
+                "inline-flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition disabled:opacity-50",
+                runnerAlive
+                  ? "border-destructive/40 bg-destructive/5 text-destructive hover:bg-destructive/10"
+                  : "border-emerald-500/40 bg-emerald-500/5 text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400",
+              )}
+            >
+              {runnerBusy ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : runnerAlive ? (
+                <Square className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              {runnerAlive ? t("runtime.stopRunner") : t("runtime.startRunner")}
+            </button>
+          ) : null}
+          {state.action ? (
+            <button
+              type="button"
+              onClick={verify}
+              disabled={verifying}
+              className="inline-flex items-center gap-2 rounded-md border border-border/60 px-4 py-2 text-sm font-medium transition hover:bg-muted/60 disabled:opacity-50"
+            >
+              {verifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              {t(state.action)}
+            </button>
+          ) : null}
+        </div>
       </div>
+
+      {runnerError ? <p role="alert" className="mt-3 text-sm text-danger">{runnerError}</p> : null}
+
+      {trading?.available ? <TradingSnapshotPanels trading={trading} t={t} /> : null}
+      {trading && !trading.available && trading.reason ? (
+        <p className="mt-3 text-sm text-muted-foreground">{trading.reason}</p>
+      ) : null}
 
       {state.kind === "not_configured" ? (
         <section className="mt-4 rounded-xl border border-dashed border-border/60 bg-muted/40 p-4 shadow-sm">
@@ -370,6 +439,159 @@ function SdkBrokerRuntimeCard({ broker, t, onRefresh }: { broker: LiveBrokerStat
       )}
       {verifyError ? <p role="alert" className="mt-3 text-sm text-danger">{verifyError}</p> : null}
     </article>
+  );
+}
+
+/** Account, P&L and open-positions panels for a broker's trading snapshot. */
+function TradingSnapshotPanels({ trading, t }: { trading: LiveTradingSnapshot; t: TFunction }) {
+  const account = trading.account;
+  const totals = trading.totals;
+  const daily = trading.daily;
+  const positions = trading.positions ?? [];
+  const openOrders = trading.open_orders ?? [];
+  const unrealized = totals?.unrealized_pnl ?? 0;
+  const realized = totals?.realized_pnl ?? 0;
+  const net = totals?.net_pnl ?? 0;
+
+  return (
+    <div className="mt-4 grid gap-3">
+      <div className="grid gap-3 md:grid-cols-4">
+        <MetricTile
+          label={t("runtime.tradingEquity")}
+          value={formatUsd(account?.equity ?? 0)}
+          hint={account?.currency ?? undefined}
+          icon={Wallet}
+          tone="neutral"
+        />
+        <MetricTile
+          label={t("runtime.tradingUnrealized")}
+          value={formatUsd(unrealized)}
+          hint={t("runtime.tradingOpenPositions", { n: totals?.open_positions ?? 0 })}
+          icon={unrealized >= 0 ? TrendingUp : TrendingDown}
+          tone={unrealized > 0 ? "success" : unrealized < 0 ? "danger" : "neutral"}
+        />
+        <MetricTile
+          label={t("runtime.tradingRealized")}
+          value={formatUsd(realized)}
+          hint={t("runtime.tradingClosedToday", { n: daily?.closed_trades ?? 0 })}
+          icon={realized >= 0 ? TrendingUp : TrendingDown}
+          tone={realized > 0 ? "success" : realized < 0 ? "danger" : "neutral"}
+        />
+        <MetricTile
+          label={t("runtime.tradingNet")}
+          value={formatUsd(net)}
+          hint={t("runtime.tradingDailyCap", {
+            used: daily?.trades ?? 0,
+            cap: daily?.cap ?? "-",
+          })}
+          icon={net >= 0 ? TrendingUp : TrendingDown}
+          tone={net > 0 ? "success" : net < 0 ? "danger" : "neutral"}
+        />
+      </div>
+
+      <RuntimePanel title={t("runtime.tradingPositions")} icon={Activity}>
+        {positions.length === 0 ? (
+          <p className="text-sm text-muted-foreground">{t("runtime.tradingNoPositions")}</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-border/60 text-[11px] uppercase text-muted-foreground">
+                  <th className="py-1.5 pr-3">{t("runtime.tradingSymbol")}</th>
+                  <th className="py-1.5 pr-3">{t("runtime.tradingSide")}</th>
+                  <th className="py-1.5 pr-3 text-right">{t("runtime.tradingVolume")}</th>
+                  <th className="py-1.5 pr-3 text-right">{t("runtime.tradingOpen")}</th>
+                  <th className="py-1.5 pr-3 text-right">{t("runtime.tradingCurrent")}</th>
+                  <th className="py-1.5 text-right">{t("runtime.tradingPnl")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {positions.map((position, index) => (
+                  <tr key={`${position.ticket ?? position.symbol}-${index}`} className="border-b border-border/40 last:border-0">
+                    <td className="py-1.5 pr-3 font-mono">{position.symbol}</td>
+                    <td className="py-1.5 pr-3">
+                      <span className={cn("font-medium", position.side === "sell" ? "text-danger" : "text-success")}>
+                        {position.side.toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="py-1.5 pr-3 text-right font-mono">{position.volume}</td>
+                    <td className="py-1.5 pr-3 text-right font-mono">{position.price_open}</td>
+                    <td className="py-1.5 pr-3 text-right font-mono">{position.price_current}</td>
+                    <td
+                      className={cn(
+                        "py-1.5 text-right font-mono font-medium",
+                        position.total_profit > 0
+                          ? "text-success"
+                          : position.total_profit < 0
+                            ? "text-danger"
+                            : "text-muted-foreground",
+                      )}
+                    >
+                      {formatUsd(position.total_profit)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </RuntimePanel>
+
+      {openOrders.length > 0 ? (
+        <RuntimePanel title={t("runtime.tradingOpenOrders")} icon={Clock3}>
+          <ul className="grid gap-1 text-sm">
+            {openOrders.map((order, index) => (
+              <li key={`${order.order_id}-${index}`} className="flex items-center justify-between gap-3 font-mono">
+                <span>{order.symbol}</span>
+                <span className="text-muted-foreground">
+                  {order.volume} @ {order.price_open} · {order.state}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </RuntimePanel>
+      ) : null}
+    </div>
+  );
+}
+
+function MetricTile({
+  label,
+  value,
+  hint,
+  icon: Icon,
+  tone,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  icon: typeof Activity;
+  tone: "success" | "danger" | "neutral";
+}) {
+  return (
+    <div className="rounded-xl border border-border/60 bg-muted/30 p-3 shadow-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
+        <Icon
+          className={cn(
+            "h-4 w-4",
+            tone === "success" && "text-success",
+            tone === "danger" && "text-danger",
+            tone === "neutral" && "text-muted-foreground",
+          )}
+        />
+      </div>
+      <div
+        className={cn(
+          "mt-2 text-xl font-semibold",
+          tone === "success" && "text-success",
+          tone === "danger" && "text-danger",
+        )}
+      >
+        {value}
+      </div>
+      {hint ? <div className="mt-0.5 text-[11px] text-muted-foreground">{hint}</div> : null}
+    </div>
   );
 }
 
@@ -538,7 +760,16 @@ function summarizeLimits(limits: LiveMandateLimits | undefined, t: TFunction): s
   const parts: string[] = [];
   if (typeof limits.max_order_notional_usd === "number") parts.push(`${formatUsd(limits.max_order_notional_usd)}${t("runtime.perOrder")}`);
   if (typeof limits.max_total_exposure_usd === "number") parts.push(`${formatUsd(limits.max_total_exposure_usd)} ${t("runtime.exposure")}`);
-  if (typeof limits.max_trades_per_day === "number") parts.push(`${limits.max_trades_per_day}${t("runtime.perDay")}`);
+  if (typeof limits.max_trades_per_day === "number") {
+    const cap = limits.max_trades_per_day >= 1000 ? "∞" : String(limits.max_trades_per_day);
+    parts.push(`${cap}${t("runtime.perDay")}`);
+  }
+  if (
+    typeof limits.max_daily_loss_pct === "number" &&
+    limits.max_daily_loss_pct > 0
+  ) {
+    parts.push(`${(limits.max_daily_loss_pct * 100).toFixed(0)}% max daily loss`);
+  }
   if (typeof limits.max_leverage === "number") parts.push(`${limits.max_leverage}${t("runtime.leverageSuffix")}`);
   if (limits.allowed_instruments?.length) parts.push(limits.allowed_instruments.join(", "));
   return parts.join(" · ") || t("runtime.limitsUnavailable");
@@ -546,6 +777,13 @@ function summarizeLimits(limits: LiveMandateLimits | undefined, t: TFunction): s
 
 function formatUsd(value: number): string {
   return `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+}
+
+/** Display name for a broker key. Tickers keep their canonical casing. */
+function formatBrokerName(broker: string): string {
+  if (broker === "mt5") return "MT5";
+  if (!broker) return broker;
+  return broker.charAt(0).toUpperCase() + broker.slice(1);
 }
 
 function formatCountdown(iso: string | undefined, t: TFunction, nowMs: number): string {

@@ -54,7 +54,9 @@ from src.live.enforcement import (
     BREACH_KIND_INSTRUMENT,
     BREACH_KIND_UNIVERSE,
     BreachEvent,
+    LIMIT_MAX_DAILY_LOSS_PCT,
     OrderIntent,
+    account_equity_usd,
     check_mandate,
     instrument_asset_class,
     last_price_usd,
@@ -66,12 +68,42 @@ from src.live.mandate.store import load_mandate
 from src.live.daily_count import (
     DailyOrderLockUnavailable,
     daily_order_lock,
+    ensure_daily_start_equity,
     increment_daily_count,
     read_daily_count,
 )
 from src.tools.mcp import MCPRemoteTool, MCPRemoteToolSpec, MCPServerAdapter
 
+try:
+    from src.providers.jev import (
+        JevError,
+        answer_probability,
+        answer_value,
+        get_jev_client,
+    )
+
+    _JEV_AVAILABLE = True
+except Exception:  # noqa: BLE001 - the guard must work without Jev
+    JevError = Exception  # type: ignore[assignment,misc]
+    answer_probability = None  # type: ignore[assignment]
+    answer_value = None  # type: ignore[assignment]
+    get_jev_client = None  # type: ignore[assignment]
+    _JEV_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+#: Minimum probability Jev must assign to "this risk is acceptable" before an
+#: order is blocked. Below it the order is denied. The threshold is read from
+#: ``JEV_RISK_MIN_PROB`` so it can be tuned without a code change.
+JEV_RISK_MIN_PROB_ENV = "JEV_RISK_MIN_PROB"
+JEV_RISK_MIN_PROB_DEFAULT = 0.4
+
+#: Whether Jev may BLOCK an order. Off by default: the project's advisory
+#: layer is observational and the mandate gate is the sole allow/deny
+#: authority. Set ``JEV_ORDER_GUARD=1`` to let a confident Jev "unacceptable
+#: risk" verdict deny the order. When off, Jev still reports its verdict
+#: through the advisory layer (see :mod:`src.live.advisory.jev`).
+JEV_ORDER_GUARD_ENV = "JEV_ORDER_GUARD"
 
 #: Frozen marker key the api_server SSE relay reads off the returned tool_result
 #: to emit a ``live.action`` event without touching the agent loop.
@@ -92,6 +124,16 @@ _DECISION_PAUSE = "pause_for_reauth"
 #: Default: off (advisory layer is purely observational and opt-in).
 _ADVISORY_ENABLED_ENV = "VIBE_TRADING_ENABLE_ADVISORY"
 _ADVISORY_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _jev_order_guard_enabled() -> bool:
+    """Whether a Jev "unacceptable risk" verdict may block an order.
+
+    Off by default. The advisory layer is observational and the mandate gate
+    is the sole allow/deny authority, so a network-backed model must not
+    silently become a blocking gate. Set ``JEV_ORDER_GUARD=1`` to opt in.
+    """
+    return os.environ.get(JEV_ORDER_GUARD_ENV, "").strip().lower() in _ADVISORY_TRUTHY
 
 
 class LiveOrderGuardTool(MCPRemoteTool):
@@ -184,9 +226,31 @@ class LiveOrderGuardTool(MCPRemoteTool):
         positions = self._read_first(self._read_tools("positions", _POSITIONS_TOOLS))
         balance = self._read_first(self._read_tools("account", _BALANCE_TOOLS))
 
+        # Additional Jev risk check. This is a fail-SAFE gate: it can only
+        # block an order, never place one. If Jev is unconfigured or errors,
+        # the order still passes - the mandate, expiry, halt flag and daily
+        # lock remain the hard gates. It runs OUTSIDE the daily-order lock so
+        # a slow Jev round-trip can never stall the counter serialization.
+        jev_denial = self._jev_risk_denial(intent, positions, balance)
+        if jev_denial is not None:
+            return self._deny(
+                reason=jev_denial,
+                checked=[
+                    "mandate",
+                    "expiry",
+                    "halt_flag",
+                    "daily_order_lock",
+                    "jev_risk",
+                ],
+                mandate=mandate,
+            )
+
         try:
             with daily_order_lock(self.broker):
                 daily_count = self._read_daily_count()
+                daily_anchor_equity = ensure_daily_start_equity(
+                    self.broker, account_equity_usd(balance)
+                )
                 breach = check_mandate(
                     mandate,
                     intent,
@@ -195,6 +259,7 @@ class LiveOrderGuardTool(MCPRemoteTool):
                     broker=self.broker,
                     remote_tool=self.remote_name,
                     daily_count=daily_count,
+                    daily_anchor_equity=daily_anchor_equity,
                 )
 
                 if breach is None:
@@ -209,7 +274,9 @@ class LiveOrderGuardTool(MCPRemoteTool):
                 mandate=mandate,
             )
 
-        if breach.kind in (BREACH_KIND_UNIVERSE, BREACH_KIND_INSTRUMENT):
+        if breach.kind in (BREACH_KIND_UNIVERSE, BREACH_KIND_INSTRUMENT) or (
+            breach.limit == LIMIT_MAX_DAILY_LOSS_PCT
+        ):
             return self._deny_breach(breach, mandate=mandate, intent=intent, reauth=False)
         return self._deny_breach(breach, mandate=mandate, intent=intent, reauth=True)
 
@@ -287,6 +354,87 @@ class LiveOrderGuardTool(MCPRemoteTool):
             logger.warning("loader quote failed for %s: %s", intent.symbol, exc)
             return None
 
+    def _jev_risk_denial(
+        self,
+        intent: OrderIntent,
+        positions: object,
+        balance: object,
+    ) -> str | None:
+        """Ask Jev whether the proposed order carries acceptable risk.
+
+        This is an additional, fail-safe gate layered on top of the mandate
+        gate. It is **opt-in**: set ``JEV_ORDER_GUARD=1`` to let a Jev
+        verdict block the order. When it is off (the default) this returns
+        ``None`` and Jev's opinion still reaches the audit trail through the
+        advisory layer.
+
+        When enabled, the check can only *block* an order, never place one.
+        If Jev is unconfigured, the request fails, or the verdict is missing,
+        the order is not blocked by this check (the mandate/expiry/halt/daily
+        -lock gates still apply).
+
+        Args:
+            intent: The normalized order intent.
+            positions: Current broker positions.
+            balance: Current broker balance snapshot.
+
+        Returns:
+            A denial reason, or ``None`` when the order may proceed.
+        """
+        if not _jev_order_guard_enabled():
+            return None
+        if not _JEV_AVAILABLE or get_jev_client is None:
+            return None
+        try:
+            threshold = float(
+                os.environ.get(JEV_RISK_MIN_PROB_ENV, JEV_RISK_MIN_PROB_DEFAULT)
+            )
+        except (TypeError, ValueError):
+            threshold = JEV_RISK_MIN_PROB_DEFAULT
+
+        context = (
+            f"Proposed order: {intent.side} {intent.symbol} "
+            f"notional ${intent.notional_usd} via {self.remote_name}. "
+            f"Broker: {self.broker}. "
+            f"Open positions: {self._brief_state(positions)}. "
+            f"Account: {self._brief_state(balance)}."
+        )
+        try:
+            client = get_jev_client()
+            if not client.is_configured:
+                return None
+            result = client.decide_from_context(context, "risk")
+        except JevError as exc:
+            logger.warning("jev risk check failed, order not blocked: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 - fail-safe, never block on error
+            logger.warning("jev risk check errored, order not blocked: %s", exc)
+            return None
+
+        probability = answer_probability(result, "acceptable_risk")
+        verdict = answer_value(result, "acceptable_risk")
+        if probability is None and verdict is None:
+            return None
+        if probability is not None and probability >= threshold:
+            return None
+        if verdict in ("yes", "acceptable", "low"):
+            # The verdict itself is positive even if the probability is low;
+            # trust the explicit verdict over the scalar.
+            return None
+        return (
+            "jev risk assessment flagged unacceptable risk "
+            f"(verdict={verdict or 'unknown'}, probability={probability if probability is not None else 0.0:.2f})"
+        )
+
+    @staticmethod
+    def _brief_state(value: object) -> str:
+        """Render a positions/balance snapshot compactly for the Jev context."""
+        if value is None:
+            return "unavailable"
+        text = value if isinstance(value, str) else str(value)
+        text = text.replace("\n", " ").strip()
+        return text[:400] if text else "unavailable"
+
     def _broker_quote_price(self, symbol: str) -> float | None:
         """Read a USD price for ``symbol`` from the broker's quote tool.
 
@@ -352,8 +500,8 @@ class LiveOrderGuardTool(MCPRemoteTool):
             "mandate", "expiry", "halt_flag", "intent",
             "exclude_symbols", "allowed_instruments", "asset_classes",
             "max_order_notional_usd", "max_total_exposure_usd",
-            "max_leverage", "max_trades_per_day", "account_funding_usd",
-            "universe_floors",
+            "max_leverage", LIMIT_MAX_DAILY_LOSS_PCT, "max_trades_per_day",
+            "account_funding_usd", "universe_floors",
         ]
         if advisory is not None:
             checked.append("advisory")
@@ -406,6 +554,15 @@ class LiveOrderGuardTool(MCPRemoteTool):
         """
         if not get_env_config().agent_tuning.vibe_trading_enable_advisory:
             return None
+
+        # Jev plugs into the project's own advisory layer: fail-open,
+        # default-off (via VIBE_TRADING_ENABLE_ADVISORY) and audit-embedded.
+        try:
+            from src.live.advisory.jev import ensure_jev_advisory_registered
+
+            ensure_jev_advisory_registered()
+        except Exception as exc:  # noqa: BLE001 - advisory is optional
+            logger.debug("jev advisory provider not registered: %s", exc)
 
         providers = get_advisory_providers()
         if not providers:

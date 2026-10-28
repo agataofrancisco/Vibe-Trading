@@ -66,6 +66,8 @@ _CEILING_ALIASES: dict[str, str] = {
     # daily trade cap
     "daily_trade_cap": "max_trades_per_day",
     "max_trades_per_day": "max_trades_per_day",
+    # daily cumulative-loss stop (fraction of the day's starting equity)
+    "max_daily_loss_pct": "max_daily_loss_pct",
     # leverage (single spelling, mapped for completeness)
     "leverage": "leverage",
     "max_leverage": "leverage",
@@ -481,6 +483,7 @@ def _profile_to_hard_caps(profile: Mapping[str, Any]) -> dict[str, Any]:
         "max_leverage": max_leverage,
         "allowed_instruments": instruments,
         "max_trades_per_day": int(profile.get("daily_trade_cap", 0) or 0),
+        "max_daily_loss_pct": float(profile.get("max_daily_loss_pct", 0.0) or 0.0),
     }
 
 

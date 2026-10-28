@@ -108,6 +108,18 @@ MARKET_SPECS: Mapping[str, _MarketSpec] = {
         close_time=time(0, 0),
         always_open=True,
     ),
+    # Spot FX trades 24/5. The real week opens Sunday ~21:00 UTC and closes
+    # Friday ~21:00 UTC, which a single daily window cannot express (it wraps
+    # past midnight), so the spec covers the unambiguous part of the week:
+    # Monday through Friday, all day UTC. The runner therefore skips the
+    # Sunday reopen and the Friday close - conservative in the safe
+    # direction (it ticks less, never more).
+    "forex": _MarketSpec(
+        tz="UTC",
+        open_time=time(0, 0),
+        close_time=time(23, 59, 59, 999999),
+        weekdays=_WEEKDAYS_MON_FRI,
+    ),
 }
 
 

@@ -20,3 +20,23 @@ def _reset_env_config():
     reset_env_config()
     yield
     reset_env_config()
+
+
+#: Opt-in switches that make the Jev integration reach the network. A
+#: developer's local ``.env`` (loaded into ``os.environ`` by
+#: ``_ensure_dotenv()``) would otherwise leak into the test process and turn
+#: order-guard tests into live HTTP round-trips — slow and flaky. Tests that
+#: want the network behaviour set the variable explicitly via
+#: ``monkeypatch.setenv`` inside the test body.
+_JEV_OPT_IN_VARS = (
+    "JEV_ADVISORY",
+    "JEV_ORDER_GUARD",
+    "JEV_LIVE_VETO",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_jev_opt_in(monkeypatch):
+    """Force the Jev integration to its default (no-network) behaviour."""
+    for name in _JEV_OPT_IN_VARS:
+        monkeypatch.delenv(name, raising=False)

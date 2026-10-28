@@ -36,6 +36,7 @@ broker. See the live-trading SPEC §7.5.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Protocol
@@ -49,6 +50,21 @@ from src.live.runtime.jobstore import JobStore
 from src.live.runtime.liveness import write_heartbeat
 from src.live.runtime.scheduler import Job, Scheduler
 from src.live.runtime.triggers import Trigger, due_now
+try:
+    from src.providers.jev import (
+        JevError,
+        answer_probability,
+        answer_value,
+        get_jev_client,
+    )
+
+    _JEV_AVAILABLE = True
+except Exception:  # noqa: BLE001 - the runner must work without Jev
+    JevError = Exception  # type: ignore[assignment,misc]
+    answer_probability = None  # type: ignore[assignment]
+    answer_value = None  # type: ignore[assignment]
+    get_jev_client = None  # type: ignore[assignment]
+    _JEV_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +223,20 @@ def _mandate_is_expired(mandate: Mandate, now: datetime) -> bool:
     return now >= expires
 
 
+def _jev_veto_enabled() -> bool:
+    """Whether a confident Jev "do not trade" verdict may skip the agent call.
+
+    Off by default: Jev's verdict is advisory, and the mandate/expiry/halt/
+    daily-lock gates plus the order guard remain the hard backstops. Set
+    ``JEV_LIVE_VETO=1`` to let Jev short-circuit a tick.
+    """
+    return os.environ.get("JEV_LIVE_VETO", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def _pin_mandate_prompt(broker: str, mandate: Mandate, now: datetime) -> str:
     """Build the autonomous-turn prompt with the full mandate pinned inline.
 
@@ -229,6 +259,22 @@ def _pin_mandate_prompt(broker: str, mandate: Mandate, now: datetime) -> str:
     instruments = ", ".join(i.value for i in caps.allowed_instruments) or "(none)"
     asset_classes = ", ".join(a.value for a in universe.asset_classes) or "(none)"
     excluded = ", ".join(universe.exclude_symbols) or "(none)"
+    # A four-figure cap is the schema-level "no practical limit" sentinel; render
+    # it as intent instead of a scary number so the model keeps taking setups.
+    trade_cap_line = (
+        "- Trades per UTC day: no practical cap — take as many high-quality "
+        "setups as the mandate allows\n"
+        if caps.max_trades_per_day >= 1000
+        else f"- Max trades per UTC day: {caps.max_trades_per_day}\n"
+    )
+    loss_stop_line = (
+        f"- Daily loss stop: once cumulative loss reaches "
+        f"{caps.max_daily_loss_pct:.0%} of the UTC day's starting equity, stop "
+        f"opening risk for the rest of the day (closing/reducing orders remain "
+        f"allowed)\n"
+        if caps.max_daily_loss_pct > 0
+        else ""
+    )
     return (
         "You are running an AUTONOMOUS live-trading tick under a bounded "
         "mandate. Trade freely INSIDE the limits below; you must NEVER place an "
@@ -243,7 +289,8 @@ def _pin_mandate_prompt(broker: str, mandate: Mandate, now: datetime) -> str:
         f"- Max total exposure (USD): {caps.max_total_exposure_usd}\n"
         f"- Max gross leverage: {caps.max_leverage}\n"
         f"- Allowed instruments: {instruments}\n"
-        f"- Max trades per UTC day: {caps.max_trades_per_day}\n\n"
+        f"{trade_cap_line}"
+        f"{loss_stop_line}\n"
         "=== DISCOVERY UNIVERSE (pick symbols within these structural filters) ===\n"
         f"- Asset classes: {asset_classes}\n"
         f"- Min market cap (USD): {universe.min_market_cap_usd}\n"
@@ -488,6 +535,14 @@ class LiveRunner:
     async def _invoke_and_audit(self, mandate: Mandate, now: datetime) -> dict[str, Any]:
         """Invoke the agent with the pinned mandate, then audit the outcome.
 
+        Jev runs first as a fast, structured read on the tick. Its verdict is
+        injected into the agent prompt so the agent starts from Jev's cheap
+        signal instead of re-deriving it, and the verdict is recorded in the
+        audit trail. By default the verdict is advisory: the hard gates stay
+        the mandate, expiry, halt flag, daily lock and the order guard. Set
+        ``JEV_LIVE_VETO=1`` to let a confident Jev "do not trade" skip the
+        agent call entirely.
+
         Args:
             mandate: The active, unexpired mandate to pin inline.
             now: The injected tick time.
@@ -496,6 +551,36 @@ class LiveRunner:
             The tick result dict.
         """
         prompt = _pin_mandate_prompt(self.broker, mandate, now)
+
+        jev_verdict = self._jev_read(mandate, now, prompt)
+        if jev_verdict is not None:
+            verdict_line, should_trade, probability = jev_verdict
+            prompt = (
+                f"{prompt}\n\n"
+                "Jev fast read (structured decision model, advisory unless "
+                "JEV_LIVE_VETO is enabled):\n"
+                f"{verdict_line}\n"
+            )
+            if _jev_veto_enabled() and not should_trade and probability >= 0.7:
+                audit_id = self._audit(
+                    kind="order_placed",
+                    outcome="accepted",
+                    intent="autonomous tick skipped — Jev veto",
+                )
+                logger.info(
+                    "jev veto for %s: %s (probability=%.2f)",
+                    self.broker,
+                    verdict_line,
+                    probability,
+                )
+                return TickResult(
+                    outcome=TICK_INVOKED,
+                    broker=self.broker,
+                    reason="skipped: jev veto",
+                    agent_result={"jev_veto": verdict_line},
+                    audit_id=audit_id,
+                ).to_dict()
+
         try:
             result = await self._agent_caller(self._session_id, prompt)
         except Exception as exc:
@@ -524,6 +609,60 @@ class LiveRunner:
             agent_result=result,
             audit_id=audit_id,
         ).to_dict()
+
+    def _jev_read(
+        self,
+        mandate: Mandate,
+        now: datetime,
+        prompt: str,
+    ) -> tuple[str, bool, float] | None:
+        """Ask Jev for a fast structured read on this tick.
+
+        Args:
+            mandate: The active mandate.
+            now: The injected tick time.
+            prompt: The pinned prompt (used as context).
+
+        Returns:
+            ``(verdict_line, should_trade, probability)``, or ``None`` when
+            Jev is unavailable or returns nothing usable.
+        """
+        if not _JEV_AVAILABLE or get_jev_client is None:
+            return None
+        try:
+            client = get_jev_client()
+            if not client.is_configured:
+                return None
+        except Exception as exc:  # noqa: BLE001 - never break the tick
+            logger.debug("jev client unavailable: %s", exc)
+            return None
+
+        context = (
+            f"Broker: {self.broker}\nTime: {now.isoformat()}\n"
+            f"Mandate: {mandate}\n"
+            f"Tick context: {prompt[:1200]}"
+        )
+        try:
+            result = client.decide_from_context(context, "trade")
+        except JevError as exc:
+            logger.warning("jev read failed, continuing without it: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 - never break the tick
+            logger.warning("jev read errored, continuing without it: %s", exc)
+            return None
+
+        verdict = answer_value(result, "should_trade")
+        probability = answer_probability(result, "should_trade")
+        confidence = answer_probability(result, "confidence")
+        if verdict is None and probability is None:
+            return None
+        should_trade = verdict == "yes"
+        verdict_line = (
+            f"should_trade={verdict or 'unknown'}"
+            f" (probability={probability if probability is not None else 0.0:.2f})"
+            f", confidence={confidence if confidence is not None else 0.0:.2f}"
+        )
+        return verdict_line, should_trade, probability if probability is not None else 0.0
 
     def _write_heartbeat(self, now: datetime) -> None:
         """Record a liveness heartbeat for this tick (best-effort).

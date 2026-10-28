@@ -454,6 +454,14 @@ class AgentConfig(ConfigBase):
 
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    #: Optional allowlist of *local* tool names. When set, only these tools
+    #: are registered with the agent; every other local tool is dropped. This
+    #: keeps the request payload small (each tool schema costs prompt tokens
+    #: on every turn) and lets an operator scope a session to one workflow -
+    #: e.g. a trading session that only needs the connector tools. ``None``
+    #: (default) registers every discovered local tool. MCP tools are not
+    #: affected: each server keeps its own ``enabled_tools`` allowlist.
+    enabled_tools: list[str] | None = None
 
     @model_validator(mode="after")
     def validate_live_broker_servers(self) -> "AgentConfig":

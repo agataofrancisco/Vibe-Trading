@@ -65,7 +65,12 @@ def profile_by_id(profile_id: str | None = None) -> TradingProfile:
     for profile in BUILTIN_PROFILES:
         if profile.id == target:
             return profile
-    raise ValueError(f"unknown trading connector profile: {target}")
+    # Name the valid ids so a caller (or an LLM that guessed an id) can
+    # self-correct instead of retrying the same unknown profile.
+    known = ", ".join(profile.id for profile in BUILTIN_PROFILES)
+    raise ValueError(
+        f"unknown trading connector profile: {target}. Valid profile ids: {known}"
+    )
 
 
 def load_selected_profile_id() -> str:

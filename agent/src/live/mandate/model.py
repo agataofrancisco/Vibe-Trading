@@ -63,6 +63,14 @@ class HardCaps:
             types. Empty == deny all (fail-closed).
         max_trades_per_day: Vibe-enforced count of order placements allowed
             per UTC calendar day. Counter persisted alongside the mandate.
+        max_daily_loss_pct: Vibe-enforced cap on the UTC day's cumulative loss,
+            expressed as a fraction of the day's starting equity (``0.05`` ==
+            -5%). ``0.0`` disables the rule (backward compatible with mandates
+            written before this field existed). Once the limit is reached, orders
+            that INCREASE exposure are denied for the rest of the UTC day; orders
+            that reduce or close existing exposure stay allowed so the agent can
+            still de-risk. The day's starting equity is persisted next to the
+            order counter on the first gate evaluation of the day.
     """
 
     account_funding_usd: float
@@ -71,6 +79,7 @@ class HardCaps:
     max_leverage: float
     allowed_instruments: tuple[InstrumentType, ...]
     max_trades_per_day: int
+    max_daily_loss_pct: float = 0.0
 
 
 @dataclass(frozen=True)

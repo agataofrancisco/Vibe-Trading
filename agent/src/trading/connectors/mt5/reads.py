@@ -238,6 +238,52 @@ def get_quote(symbol: str, *, config: MT5Config | None = None, **_: Any) -> dict
     return _envelope(cfg, symbol=clean, resolved_symbol=name, quote=quote)
 
 
+def get_daily_deals(config: MT5Config | None = None, *, days: int = 1) -> dict[str, Any]:
+    """Fetch closed deals for the last *days* UTC days, for realized P&L.
+
+    Only *closing* deals carry realized profit (an entry deal's ``profit`` is
+    0.0), so the realized total is the sum over ``entry == DEAL_ENTRY_OUT``
+    rows. The per-deal rows let the caller break the total down per symbol.
+
+    Args:
+        config: Optional MT5 config (loaded from disk when omitted).
+        days: How many trailing UTC days to include (default 1 = today).
+
+    Returns:
+        An envelope with ``deals`` (rows) and ``realized_profit_usd``
+        (sum of the closing deals' profit plus their swap).
+    """
+    cfg = config or _client.load_config()
+    try:
+        with _client._session(cfg) as mt5:
+            now = datetime.now(timezone.utc)
+            since = now - timedelta(days=max(1, int(days)))
+            entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1)
+            rows: list[dict[str, Any]] = []
+            for deal in mt5.history_deals_get(since, now) or ():
+                entry = getattr(deal, "entry", None)
+                profit = getattr(deal, "profit", None)
+                swap = getattr(deal, "swap", None)
+                rows.append(
+                    {
+                        "deal_id": str(getattr(deal, "ticket", "")),
+                        "order_id": str(getattr(deal, "order", "")),
+                        "symbol": getattr(deal, "symbol", ""),
+                        "side": "sell" if entry == entry_out else "buy",
+                        "is_closing": entry == entry_out,
+                        "volume": getattr(deal, "volume", None),
+                        "price": getattr(deal, "price", None),
+                        "profit": float(profit) if profit is not None else 0.0,
+                        "swap": float(swap) if swap is not None else 0.0,
+                        "time": getattr(deal, "time", None),
+                    }
+                )
+    except _MT5_ERRORS as exc:
+        return _error(cfg, str(exc))
+    realized = sum(row["profit"] + row["swap"] for row in rows if row["is_closing"])
+    return _envelope(cfg, deals=rows, realized_profit_usd=realized)
+
+
 def get_historical_bars(
     symbol: str,
     *,

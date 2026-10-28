@@ -94,6 +94,9 @@ def _parse_mandate(raw: object) -> Mandate:
             InstrumentType(value) for value in caps["allowed_instruments"]
         ),
         max_trades_per_day=int(caps["max_trades_per_day"]),
+        # Optional daily-loss ceiling; absent on older mandates → 0.0 (disabled),
+        # keeping the loader backward-compatible.
+        max_daily_loss_pct=float(caps.get("max_daily_loss_pct") or 0.0),
     )
     universe_constraint = UniverseConstraint(
         asset_classes=tuple(AssetClass(value) for value in universe["asset_classes"]),

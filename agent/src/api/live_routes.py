@@ -120,6 +120,7 @@ class MandateLimits(BaseModel):
     max_trades_per_day: int
     allowed_instruments: List[str]
     account_funding_usd: float
+    max_daily_loss_pct: float = 0.0
 
 
 class ActiveMandateState(BaseModel):
@@ -152,6 +153,19 @@ class LiveBrokerStatus(BaseModel):
     mandate: Optional[ActiveMandateState] = None
     runner: RunnerLivenessState
     halted: bool = Field(..., description="Per-broker OR global kill switch is tripped")
+    trading: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Live trading snapshot for the broker's active profile: account "
+            "balance/equity, open positions with unrealized P&L, resting "
+            "orders, and today's realized P&L. Null when the broker has no "
+            "readable trading profile."
+        ),
+    )
+    runner_supported: bool = Field(
+        False,
+        description="Whether the managed live runner can drive this broker",
+    )
 
 
 class LiveStatusResponse(BaseModel):
@@ -354,10 +368,15 @@ def _emit_live_event(session_id: Optional[str], event_type: str, data: Dict[str,
 
 
 def _live_broker_adapter(broker: str) -> Any:
-    """Build an ``MCPServerAdapter`` for a live broker from the user-side config.
+    """Build an adapter for a live broker from the user-side config.
+
+    Remote-MCP brokers (Robinhood) get an :class:`MCPServerAdapter`. Direct-SDK
+    brokers (MT5) have no MCP server and are reached through
+    :class:`~src.live.sdk_adapter.SdkBrokerAdapter`, which exposes the same
+    ``call_tool`` surface over the connector's Python API.
 
     Raises:
-        LiveRunnerUnavailable: When no MCP server is configured for the broker.
+        LiveRunnerUnavailable: When no adapter can be built for the broker.
     """
     from src.config.loader import load_agent_config
     from src.tools.mcp import MCPServerAdapter
@@ -378,6 +397,19 @@ def _live_broker_adapter(broker: str) -> Any:
                 is_match = False
         if is_match:
             return MCPServerAdapter(name, server_cfg)
+
+    # No MCP server for this broker: fall back to the direct-SDK adapter when
+    # the connector ships a runner-capable live profile. A remote-MCP broker
+    # (Robinhood) still requires its MCP server - it must not silently fall
+    # back to a different transport.
+    from src.trading.service import live_runner_profile_for_broker
+
+    profile = live_runner_profile_for_broker(broker)
+    if profile is not None and profile.transport == "broker_sdk":
+        from src.live.sdk_adapter import SdkBrokerAdapter
+
+        return SdkBrokerAdapter(broker, profile_id=profile.id)
+
     raise LiveRunnerUnavailable(f"no MCP server configured for live broker {broker!r}")
 
 
@@ -498,6 +530,7 @@ def _active_mandate_state(broker: str) -> Optional[ActiveMandateState]:
             max_trades_per_day=caps.max_trades_per_day,
             allowed_instruments=[str(getattr(i, "value", i)) for i in caps.allowed_instruments],
             account_funding_usd=caps.account_funding_usd,
+            max_daily_loss_pct=caps.max_daily_loss_pct,
         ),
     )
 
@@ -576,6 +609,11 @@ def _build_live_runner(broker: str) -> Any:
     session = svc.create_session(title=f"live-runner:{broker}")
     session_id = session.session_id
 
+    # The SDK adapter stamps audit events with the originating session; the
+    # MCP adapter does not need it (it has no session field).
+    if hasattr(adapter, "session_id"):
+        adapter.session_id = session_id
+
     async def _agent_caller(sid: str, prompt: str) -> Dict[str, Any]:
         return await svc.send_message(sid, prompt)
 
@@ -604,11 +642,23 @@ def _build_live_runner(broker: str) -> Any:
         submit_fn=_submit,
         write_audit_fn=_audit_with_bus,
         scheduler=scheduler,
-        triggers=[Trigger.market("us_equity")],
+        triggers=[Trigger.market(_market_for_broker(broker))],
         session_id=session_id,
     )
     runner_holder["runner"] = runner
     return runner
+
+
+def _market_for_broker(broker: str) -> str:
+    """Return the market-session key the runner should tick on.
+
+    Forex/CFD brokers (MT5) trade on the FX week, not the US equity
+    session; everything else defaults to the US equity session the runner
+    was originally specified against.
+    """
+    if broker == "mt5":
+        return "forex"
+    return "us_equity"
 
 
 async def _drive_runner(runner: Any) -> None:
@@ -873,6 +923,37 @@ def register_live_routes(
                 except Exception:  # noqa: BLE001 - status must never raise
                     sdk_metadata = {}
 
+            # Live trading snapshot (account, positions, P&L). Best-effort:
+            # a broker without a readable trading profile reports null, and a
+            # failing read must never take the whole status down.
+            trading_snapshot: Optional[Dict[str, Any]] = None
+            runner_supported = False
+            try:
+                from src.trading.service import live_runner_profile_for_broker
+
+                runner_profile = live_runner_profile_for_broker(key)
+                runner_supported = runner_profile is not None
+                if runner_profile is not None:
+                    from src.live.trading_snapshot import build_trading_snapshot
+
+                    trading_snapshot = build_trading_snapshot(
+                        key, profile_id=runner_profile.id
+                    )
+            except Exception:  # noqa: BLE001 - status must never raise
+                trading_snapshot = None
+
+            # A readable trading snapshot proves the connector is attached and
+            # configured on the profile the operator actually trades with. The
+            # read-only profile probe above cannot see a demo account (it is
+            # hard-scoped to a live one), so without this the panel would
+            # report "status unavailable" for a perfectly working demo.
+            if trading_snapshot and trading_snapshot.get("available"):
+                snapshot_profile = trading_snapshot.get("profile_id")
+                if isinstance(snapshot_profile, str) and snapshot_profile:
+                    sdk_metadata["profile_id"] = snapshot_profile
+                sdk_metadata["configured"] = True
+                sdk_metadata["connection_state"] = "connected"
+
             statuses.append(
                 LiveBrokerStatus(
                     auth=BrokerAuthState(
@@ -885,6 +966,8 @@ def register_live_routes(
                     mandate=h._active_mandate_state(key),
                     runner=_runner_liveness_state(key),
                     halted=halt_flag_set(broker=key),
+                    trading=trading_snapshot,
+                    runner_supported=runner_supported,
                 )
             )
 

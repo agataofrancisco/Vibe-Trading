@@ -31,13 +31,16 @@ from src.live.audit import LiveActionEvent, write_live_action
 from src.live.daily_count import (
     DailyOrderLockUnavailable,
     daily_order_lock,
+    ensure_daily_start_equity,
     increment_daily_count,
     read_daily_count,
 )
 from src.live.enforcement import (
     BREACH_KIND_INSTRUMENT,
     BREACH_KIND_UNIVERSE,
+    LIMIT_MAX_DAILY_LOSS_PCT,
     OrderIntent,
+    account_equity_usd,
     check_mandate,
     instrument_asset_class,
     last_price_usd,
@@ -109,9 +112,15 @@ def execute_live_order(
     try:
         with daily_order_lock(broker):
             daily_count = read_daily_count(broker)
+            # Anchor the UTC day's starting equity on the first gate call, then
+            # reuse it so the 5% daily-loss stop measures the whole day.
+            daily_anchor_equity = ensure_daily_start_equity(
+                broker, account_equity_usd(balance)
+            )
             breach = check_mandate(
                 mandate, intent, positions, balance,
                 broker=broker, remote_tool=_REMOTE_TOOL, daily_count=daily_count,
+                daily_anchor_equity=daily_anchor_equity,
             )
 
             if breach is None:
@@ -129,7 +138,10 @@ def execute_live_order(
             intent=intent,
         )
 
-    reauth = breach.kind not in (BREACH_KIND_UNIVERSE, BREACH_KIND_INSTRUMENT)
+    reauth = (
+        breach.kind not in (BREACH_KIND_UNIVERSE, BREACH_KIND_INSTRUMENT)
+        and breach.limit != LIMIT_MAX_DAILY_LOSS_PCT
+    )
     return _deny_breach(broker, session_id, breach, mandate, intent, reauth)
 
 
@@ -150,7 +162,8 @@ def _allow(broker, session_id, connector_module, config, intent, place_kwargs, m
     checked = [
         "mandate", "expiry", "halt_flag", "exclude_symbols", "allowed_instruments",
         "asset_classes", "max_order_notional_usd", "max_total_exposure_usd",
-        "max_leverage", "max_trades_per_day", "account_funding_usd", "universe_floors",
+        "max_leverage", "max_daily_loss_pct", "max_trades_per_day",
+        "account_funding_usd", "universe_floors",
     ]
     if is_error:
         record = _audit(

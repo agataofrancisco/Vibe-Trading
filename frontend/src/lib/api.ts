@@ -985,6 +985,7 @@ export interface LiveMandateLimits {
   max_total_exposure_usd?: number;
   max_leverage?: number;
   max_trades_per_day?: number;
+  max_daily_loss_pct?: number;
   allowed_instruments?: string[];
   account_funding_usd?: number;
   [key: string]: unknown;
@@ -1049,11 +1050,90 @@ export interface ConnectorVerifyResponse {
 }
 
 /** One broker entry in the `GET /live/status` response. */
+/** One open position with its live mark and unrealized P&L. */
+export interface LiveTradingPosition {
+  ticket?: number | string | null;
+  symbol: string;
+  side: string;
+  volume: number;
+  price_open: number;
+  price_current: number;
+  /** Floating P&L excluding swap. */
+  profit: number;
+  swap: number;
+  /** Floating P&L including swap. */
+  total_profit: number;
+  /** Position notional in USD, when the connector can price it. */
+  notional: number;
+}
+
+/** One resting order. */
+export interface LiveTradingOrder {
+  order_id: string;
+  symbol: string;
+  volume: number;
+  price_open: number;
+  state: string;
+}
+
+/** Account summary for the broker's active trading profile. */
+export interface LiveTradingAccount {
+  login?: number | string | null;
+  name?: string | null;
+  server?: string | null;
+  currency?: string | null;
+  balance: number;
+  equity: number;
+  margin: number;
+  margin_free: number;
+  leverage: number;
+  is_demo?: boolean | null;
+}
+
+/** Today's trading activity for the broker. */
+export interface LiveTradingDaily {
+  /** Orders the gate allowed today. */
+  trades: number;
+  /** The mandate's daily cap, when a mandate is committed. */
+  cap: number | null;
+  /** Positions closed today. */
+  closed_trades: number;
+  realized_pnl: number;
+}
+
+/** Aggregated P&L for the broker. */
+export interface LiveTradingTotals {
+  unrealized_pnl: number;
+  realized_pnl: number;
+  net_pnl: number;
+  open_positions: number;
+  open_orders: number;
+  open_notional: number;
+}
+
+/** Live trading snapshot attached to a broker in `GET /live/status`. */
+export interface LiveTradingSnapshot {
+  /** False when the broker has no readable trading profile. */
+  available: boolean;
+  reason?: string;
+  profile_id?: string;
+  environment?: string;
+  account?: LiveTradingAccount;
+  positions?: LiveTradingPosition[];
+  open_orders?: LiveTradingOrder[];
+  daily?: LiveTradingDaily;
+  totals?: LiveTradingTotals;
+}
+
 export interface LiveBrokerStatus {
   auth: LiveBrokerAuthStatus;
   mandate?: LiveMandateStatus | null;
   runner: LiveRunnerLiveness;
   halted: boolean;
+  /** Live account / positions / P&L for this broker, when readable. */
+  trading?: LiveTradingSnapshot | null;
+  /** Whether the managed live runner can drive this broker. */
+  runner_supported?: boolean;
 }
 
 /** Response of `GET /live/status` (SPEC §7.5 runner status panel + C2). */

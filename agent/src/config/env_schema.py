@@ -130,6 +130,12 @@ class LLMConfig(_EnvBase):
     langchain_model_name: str = Field(alias="LANGCHAIN_MODEL_NAME", default="")
     langchain_temperature: float = Field(alias="LANGCHAIN_TEMPERATURE", default=0.0)
     anthropic_max_tokens: int | None = Field(alias="ANTHROPIC_MAX_TOKENS", default=None, gt=0)
+    #: Output-token ceiling for the OpenAI-compatible chat path. Some gateways
+    #: (and free tiers) bill against the *requested* ceiling rather than the
+    #: actual usage, so an unset value (the model's full max output) can be
+    #: rejected with HTTP 402 even when the prompt itself is affordable.
+    #: Set it to fit the available budget.
+    langchain_max_tokens: int | None = Field(alias="LANGCHAIN_MAX_TOKENS", default=None, gt=0)
     timeout_seconds: int = Field(alias="TIMEOUT_SECONDS", default=120)
     max_retries: int = Field(alias="MAX_RETRIES", default=2)
     langchain_reasoning_effort: str = Field(alias="LANGCHAIN_REASONING_EFFORT", default="")

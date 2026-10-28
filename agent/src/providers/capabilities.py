@@ -192,6 +192,12 @@ _PROVIDERS: dict[str, ProviderCapabilities] = {
     "opencode-go": ProviderCapabilities(
         "opencode-go", "OPENAI_API_KEY", "OPENAI_BASE_URL"
     ),
+    # Jev (TypeSafe AI) rides the same OpenRouter gateway and key as the LLM.
+    "jev": ProviderCapabilities(
+        "jev",
+        "OPENROUTER_API_KEY",
+        "JEV_BASE_URL",
+    ),
 }
 
 

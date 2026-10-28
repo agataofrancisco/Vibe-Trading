@@ -1002,7 +1002,11 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
         if profile.get("max_order_usd") is not None:
             bits.append(f"≤${profile['max_order_usd']}/order")
         if profile.get("daily_trade_cap") is not None:
-            bits.append(f"{profile['daily_trade_cap']} trades/day")
+            cap = profile["daily_trade_cap"]
+            bits.append("unlimited trades/day" if cap >= 1000 else f"{cap} trades/day")
+        loss_pct = profile.get("max_daily_loss_pct")
+        if isinstance(loss_pct, (int, float)) and loss_pct > 0:
+            bits.append(f"stop at -{loss_pct:.0%}/day")
         leverage = profile.get("leverage")
         if leverage in (None, "none", "None", 1, 1.0):
             bits.append("no leverage")

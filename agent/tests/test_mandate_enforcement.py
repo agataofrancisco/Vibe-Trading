@@ -586,3 +586,111 @@ def test_notional_quantity_bypass_is_closed(live_runtime: Path) -> None:
     assert out["breach"]["attempted_value"] == 1_000_000.0
     assert adapter.order_calls == []  # never forwarded
     assert adapter.quote_calls  # broker quote tool was consulted
+
+
+# --------------------------------------------------------------------------- #
+# Daily cumulative-loss stop (max_daily_loss_pct)                             #
+# --------------------------------------------------------------------------- #
+
+
+def _check_loss(
+    intent: OrderIntent,
+    mandate: Mandate,
+    *,
+    positions=None,
+    equity: Any = 5000.0,
+    anchor: float | None = 5000.0,
+):
+    return check_mandate(
+        mandate,
+        intent,
+        positions if positions is not None else [],
+        {"equity": equity},
+        broker="robinhood",
+        remote_tool="place_equity_order",
+        daily_count=0,
+        daily_anchor_equity=anchor,
+    )
+
+
+def test_daily_loss_stop_blocks_new_risk_after_five_percent() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    breach = _check_loss(_intent(), mandate, equity=4700.0, anchor=5000.0)
+    assert breach is not None
+    assert breach.limit == "max_daily_loss_pct"
+    assert breach.kind == BREACH_KIND_QUANTITATIVE
+    assert breach.attempted_value == pytest.approx(0.06)
+
+
+def test_daily_loss_stop_allows_trading_below_the_limit() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    assert _check_loss(_intent(), mandate, equity=4800.0, anchor=5000.0) is None
+
+
+def test_daily_loss_stop_allows_a_sell_that_reduces_a_long() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    positions = [{"symbol": "AAPL", "market_value": 2000.0, "side": "long"}]
+    breach = _check_loss(
+        _intent(side="sell", notional_usd=100.0),
+        mandate,
+        positions=positions,
+        equity=4700.0,
+        anchor=5000.0,
+    )
+    assert breach is None
+
+
+def test_daily_loss_stop_allows_a_buy_that_reduces_a_short() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    positions = [{"symbol": "AAPL", "market_value": 2000.0, "side": "short"}]
+    breach = _check_loss(
+        _intent(side="buy", notional_usd=100.0),
+        mandate,
+        positions=positions,
+        equity=4700.0,
+        anchor=5000.0,
+    )
+    assert breach is None
+
+
+def test_daily_loss_stop_still_blocks_a_new_short_after_breach() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    breach = _check_loss(
+        _intent(side="sell", notional_usd=100.0),
+        mandate,
+        equity=4700.0,
+        anchor=5000.0,
+    )
+    assert breach is not None and breach.limit == "max_daily_loss_pct"
+
+
+def test_daily_loss_stop_blocks_a_sell_that_flips_to_larger_short() -> None:
+    """A sell through zero into a bigger opposite position adds risk, not reduces."""
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    positions = [{"symbol": "AAPL", "market_value": 300.0, "side": "long"}]
+    breach = _check_loss(
+        _intent(side="sell", notional_usd=700.0),
+        mandate,
+        positions=positions,
+        equity=4700.0,
+        anchor=5000.0,
+    )
+    assert breach is not None and breach.limit == "max_daily_loss_pct"
+
+
+def test_daily_loss_stop_fails_closed_when_equity_is_unreadable() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    breach = _check_loss(_intent(), mandate, equity=None)
+    assert breach is not None and breach.limit == "max_daily_loss_pct"
+
+
+def test_daily_loss_rule_is_disabled_by_default() -> None:
+    # Legacy mandates carry no max_daily_loss_pct (0.0) and must keep passing.
+    mandate = _mandate()
+    assert _check_loss(_intent(), mandate, equity=1000.0, anchor=5000.0) is None
+
+
+def test_daily_loss_stop_is_skipped_without_an_anchor() -> None:
+    mandate = _mandate(max_daily_loss_pct=0.05)
+    assert _check_loss(_intent(), mandate, equity=1000.0, anchor=None) is None
+

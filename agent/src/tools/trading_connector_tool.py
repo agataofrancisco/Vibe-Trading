@@ -131,7 +131,23 @@ def _num_or_none(value: Any, field: str = "value") -> float | None:
 TRADING_COMMON_PARAMETERS = {
     "connection": {
         "type": "string",
-        "description": "Trading connector profile id, e.g. ibkr-paper-local or robinhood-live-mcp. Defaults to the selected profile.",
+        "description": (
+            "Trading connector profile id. Omit this to use the selected profile. "
+            "Valid ids: ibkr-paper-local, ibkr-live-local-readonly, "
+            "ibkr-live-official-mcp-readonly, robinhood-live-mcp, tiger-paper-sdk, "
+            "tiger-live-sdk-readonly, tiger-paper-trade, tiger-live-trade, "
+            "longbridge-paper-sdk, longbridge-paper-trade, "
+            "longbridge-live-sdk-readonly, alpaca-paper-sdk, "
+            "alpaca-live-sdk-readonly, alpaca-paper-trade, alpaca-live-trade, "
+            "okx-paper-sdk, okx-live-sdk-readonly, okx-paper-trade, okx-live-trade, "
+            "binance-paper-sdk, binance-live-sdk-readonly, binance-paper-trade, "
+            "binance-live-trade, futu-paper-sdk, futu-live-sdk-readonly, "
+            "futu-paper-trade, futu-live-trade, dhan-paper-sdk, dhan-paper-trade, "
+            "dhan-live-sdk-readonly, shoonya-paper-sdk, shoonya-paper-trade, "
+            "shoonya-live-sdk-readonly, trading212-paper-sdk, "
+            "trading212-live-sdk-readonly, mt5-paper-sdk, mt5-live-sdk-readonly, "
+            "mt5-paper-trade, mt5-live-trade. Call trading_connections to list them."
+        ),
     },
     "host": {
         "type": "string",

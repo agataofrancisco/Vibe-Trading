@@ -132,11 +132,22 @@ def build_registry(
     # Tools that need the host session id injected: they create or mutate the
     # session's research goal, and the LLM never knows the session id.
     session_injected_classes = goal_tool_classes | {RunResearchAutopilotTool}
+    # Optional operator allowlist for *local* tools. Every tool schema is
+    # re-sent on every LLM turn, so a focused session pays for it in prompt
+    # tokens. MCP tools keep their own per-server allowlist.
+    local_allowlist: set[str] | None = None
+    if agent_config is not None:
+        configured = getattr(agent_config, "enabled_tools", None)
+        if configured is not None:
+            local_allowlist = {str(name) for name in configured}
     registry = ToolRegistry()
     for cls in _discover_subclasses():
         try:
             if cls.name in _SHELL_TOOL_NAMES and not include_shell_tools:
                 logger.info("Tool %s disabled by shell tool policy", cls.name)
+                continue
+            if local_allowlist is not None and cls.name not in local_allowlist:
+                logger.info("Tool %s not in the configured allowlist, skipping", cls.name)
                 continue
             if not cls.check_available():
                 logger.info("Tool %s unavailable, skipping", cls.name)

@@ -202,5 +202,14 @@
     "default_model": "qwen2.5:32b",
     "default_base_url": "http://localhost:11434",
     "api_key_required": false
+  },
+  {
+    "name": "jev",
+    "label": "Jev (TypeSafe AI)",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "base_url_env": "JEV_BASE_URL",
+    "default_model": "typesafe/jev-router",
+    "default_base_url": "https://openrouter.ai/api/v1",
+    "api_key_required": true
   }
 ]

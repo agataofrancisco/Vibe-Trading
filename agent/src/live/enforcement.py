@@ -79,6 +79,11 @@ BREACH_KIND_UNIVERSE = "universe"
 BREACH_KIND_INSTRUMENT = "instrument"
 BREACH_KIND_QUANTITATIVE = "quantitative"
 
+#: Limit name for the daily cumulative-loss hard stop. Unlike the other
+#: quantitative limits, a breach is a plain DENY (no re-authorization prompt):
+#: the trading day is over and the stop must not be widened mid-day.
+LIMIT_MAX_DAILY_LOSS_PCT = "max_daily_loss_pct"
+
 #: InstrumentType → the AssetClass bucket it belongs to. OPTION and CFD have no
 #: universe-level asset-class bucket (the user permits asset classes, not
 #: option chains or CFD catalogs), so both are gated purely by
@@ -429,16 +434,61 @@ def _position_signed_market_value(row: dict) -> float | None:
 def _account_balance_market_value(balance: object) -> float | None:
     """Return account funding/equity in USD from the balance payload.
 
-    This is read defensively for completeness; mandate leverage math uses the
-    mandate's ``account_funding_usd`` as the denominator per SPEC §5, so this
-    helper is only used to sanity-parse the read payload. Returns ``None`` when
-    unparseable.
+    Accepts both a flat mapping (``{"equity": ...}``) and the connector
+    envelopes that nest the fields under ``"account"`` (MT5's
+    ``get_account_snapshot`` returns ``{"status": "ok", "account": {...}}``).
+    Returns ``None`` when unparseable.
     """
     if isinstance(balance, dict):
+        nested = balance.get("account")
+        if isinstance(nested, dict):
+            value = _account_balance_market_value(nested)
+            if value is not None:
+                return value
         for key in ("equity", "buying_power", "cash", "account_value", "total"):
             if key in balance:
                 return _as_float(balance[key])
     return _as_float(balance)
+
+
+def account_equity_usd(balance: object) -> float | None:
+    """Public wrapper: current account equity in USD, or ``None`` if unreadable.
+
+    The live gates use this both to anchor the day's starting equity and to
+    measure the day's cumulative loss against ``max_daily_loss_pct``.
+    """
+    return _account_balance_market_value(balance)
+
+
+def _order_reduces_exposure(
+    positions: object, symbol: str, side: str, order_notional: float
+) -> bool:
+    """Return whether the order shrinks net exposure on ``symbol``.
+
+    Compares the symbol's current signed market value with its post-trade signed
+    market value: a sell reduces only an existing long, a buy reduces only an
+    existing short, and an order that flips through zero into a larger opposite
+    position does NOT count as reducing. Used by the daily-loss stop so a
+    breached day still allows de-risking without letting a reversal-sized order
+    open fresh risk. Ambiguous/unreadable positions are treated as non-reducing
+    (fail-closed: the order is denied).
+    """
+    rows = _coerce_position_rows(positions)
+    if rows is None:
+        return False
+    current = 0.0
+    for row in rows:
+        row_symbol = _position_symbol(row)
+        if row_symbol != symbol:
+            continue
+        signed_value = _position_signed_market_value(row)
+        if signed_value is None:
+            return False
+        current += signed_value
+    if side not in ("buy", "sell"):
+        return False
+    delta = abs(order_notional) if side == "buy" else -abs(order_notional)
+    return abs(current + delta) < abs(current)
 
 
 def _as_float(value: object) -> float | None:
@@ -461,15 +511,16 @@ def check_mandate(
     broker: str,
     remote_tool: str,
     daily_count: int,
+    daily_anchor_equity: float | None = None,
 ) -> BreachEvent | None:
     """Evaluate one order intent against the mandate (fail-closed).
 
     Checks run in a fixed order and the first failure produces the verdict:
     exclude-list, instrument allowance, asset-class allowance (universe market-
     cap/liquidity), single-order notional, post-trade total exposure, post-trade
-    gross leverage, daily order count, and funding (defense-in-depth). Any
-    unparseable input (bad intent, unreadable positions, missing market data)
-    denies rather than allows.
+    gross leverage, daily loss stop, daily order count, and funding (defense-in-
+    depth). Any unparseable input (bad intent, unreadable positions, missing
+    market data) denies rather than allows.
 
     Args:
         mandate: The active, schema-valid, unexpired mandate (validated by the
@@ -481,6 +532,9 @@ def check_mandate(
         remote_tool: Broker remote tool name the agent invoked.
         daily_count: Orders already placed today (from the persisted counter,
             after UTC rollover).
+        daily_anchor_equity: Account equity at the start of the UTC day, used as
+            the denominator of the ``max_daily_loss_pct`` stop. ``None`` skips
+            the stop (rule unconfigured or anchor unavailable).
 
     Returns:
         ``None`` when the order is fully in-mandate (ALLOW), otherwise a
@@ -583,7 +637,43 @@ def check_mandate(
             limit_value=caps.max_leverage, attempted_value=post_leverage,
         )
 
-    # 7. Daily order count (count over UTC calendar days).
+    # 7. Daily cumulative-loss stop. Measured from the day's starting equity to
+    #    current equity (realized + unrealized), so a string of losses halts new
+    #    risk for the rest of the UTC day. Only risk-INCREASING orders are
+    #    blocked: a sell that reduces an existing long (or a buy that reduces an
+    #    existing short) still passes so the agent can de-risk. Fail-closed when
+    #    the configured rule cannot read equity.
+    if caps.max_daily_loss_pct > 0 and daily_anchor_equity is not None:
+        if daily_anchor_equity <= 0:
+            return _breach(
+                broker=broker, remote_tool=remote_tool, intent=intent,
+                kind=BREACH_KIND_QUANTITATIVE, limit=LIMIT_MAX_DAILY_LOSS_PCT,
+                limit_value=caps.max_daily_loss_pct, attempted_value=0.0,
+                detail="daily starting equity is non-positive (fail-closed)",
+            )
+        current_equity = _account_balance_market_value(balance)
+        if current_equity is None:
+            return _breach(
+                broker=broker, remote_tool=remote_tool, intent=intent,
+                kind=BREACH_KIND_QUANTITATIVE, limit=LIMIT_MAX_DAILY_LOSS_PCT,
+                limit_value=caps.max_daily_loss_pct, attempted_value=0.0,
+                detail="account equity could not be read (fail-closed)",
+            )
+        loss_pct = (daily_anchor_equity - current_equity) / daily_anchor_equity
+        if loss_pct >= caps.max_daily_loss_pct and not _order_reduces_exposure(
+            positions, symbol, intent.side, notional
+        ):
+            return _breach(
+                broker=broker, remote_tool=remote_tool, intent=intent,
+                kind=BREACH_KIND_QUANTITATIVE, limit=LIMIT_MAX_DAILY_LOSS_PCT,
+                limit_value=caps.max_daily_loss_pct, attempted_value=loss_pct,
+                detail=(
+                    "daily cumulative loss reached the mandate stop; only "
+                    "exposure-reducing orders are allowed until the UTC day rolls"
+                ),
+            )
+
+    # 8. Daily order count (count over UTC calendar days).
     attempted_count = daily_count + 1
     if attempted_count > caps.max_trades_per_day:
         return _breach(
@@ -593,7 +683,7 @@ def check_mandate(
             attempted_value=float(attempted_count),
         )
 
-    # 8. Funding (defense-in-depth; broker is the real ceiling). Only a buy can
+    # 9. Funding (defense-in-depth; broker is the real ceiling). Only a buy can
     #    push us past funding — never block a sell on this.
     if intent.side == "buy" and post_exposure > caps.account_funding_usd:
         return _breach(
@@ -603,7 +693,7 @@ def check_mandate(
             detail="post-trade exposure exceeds mirrored funding ceiling",
         )
 
-    # 9. Expensive universe rules (market-cap / liquidity floors). Fail-closed
+    # 10. Expensive universe rules (market-cap / liquidity floors). Fail-closed
     #    on missing data per SPEC §5. Skipped for instruments with no equity
     #    universe bucket (e.g. options) where these floors do not apply.
     if asset_class is not None:

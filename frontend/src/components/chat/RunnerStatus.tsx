@@ -71,7 +71,11 @@ function summarizeLimits(limits: LiveMandateLimits | undefined): string {
   if (!limits) return "";
   const parts: string[] = [];
   if (limits.max_order_notional_usd != null) parts.push(`≤${formatUsd(limits.max_order_notional_usd)}/order`);
-  if (limits.max_trades_per_day != null) parts.push(`${limits.max_trades_per_day}/day`);
+  if (limits.max_trades_per_day != null) {
+    const cap = limits.max_trades_per_day >= 1000 ? "∞" : String(limits.max_trades_per_day);
+    parts.push(`${cap}/day`);
+  }
+  if (limits.max_daily_loss_pct) parts.push(`${Math.round(limits.max_daily_loss_pct * 100)}% max loss/day`);
   if (limits.max_leverage != null) parts.push(limits.max_leverage <= 1 ? "no leverage" : `${limits.max_leverage}×`);
   return parts.join(" · ");
 }

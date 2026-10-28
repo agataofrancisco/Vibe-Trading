@@ -49,14 +49,17 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
         label="MetaTrader 5 Demo · Trading",
         environment="paper",
         transport="broker_sdk",
-        capabilities=READ_CAPABILITIES + ("orders.place",),
+        capabilities=READ_CAPABILITIES
+        + ("orders.place", "runner.manage.requires_mandate"),
         readonly=False,
         config={"profile": "paper"},
         notes=(
             "Places orders on a DEMO MT5 account (e.g. Exness demo). Connector "
             "size guards (max_order_volume / max_order_notional_usd in mt5.json) "
-            "apply even on demo. Note: MT5 hedging accounts OPEN a hedge on an "
-            "opposite-side order; close positions by ticket via cancel."
+            "apply even on demo. The managed live runner can drive this profile: "
+            "its orders go through the mandate gate, so the caps still bind. "
+            "Note: MT5 hedging accounts OPEN a hedge on an opposite-side order; "
+            "close positions by ticket via cancel."
         ),
     ),
     TradingProfile(
@@ -65,14 +68,16 @@ MT5_PROFILES: tuple[TradingProfile, ...] = (
         label="MetaTrader 5 Live · Trading",
         environment="live",
         transport="broker_sdk",
-        capabilities=READ_CAPABILITIES + ("orders.place.requires_mandate",),
+        capabilities=READ_CAPABILITIES
+        + ("orders.place.requires_mandate", "runner.manage.requires_mandate"),
         readonly=False,
         config={"profile": "live"},
         notes=(
             "Places orders on a REAL MT5 account. Live order placement is gated "
             "behind a user-defined mandate (forex/cfd instrument allowances, "
             "lot-aware USD notional caps) and the kill switch, plus the "
-            "connector's own size guards."
+            "connector's own size guards. The managed live runner can drive "
+            "this profile (direct-SDK adapter, not MCP)."
         ),
     ),
 )

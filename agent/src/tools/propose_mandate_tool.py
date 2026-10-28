@@ -28,10 +28,13 @@ from src.live.mandate.commit import _normalize_limits, save_proposal
 #: profiles. Each is a fraction of the funded ceiling so they always clamp down.
 _PROFILE_TEMPLATES: tuple[dict[str, Any], ...] = (
     {"ordinal": 1, "label": "稳健", "order_fraction": 0.05, "daily_trade_cap": 2,
+     "daily_loss_pct": 0.02,
      "notes": "Smallest clips, fewest trades — capital-preservation tilt."},
     {"ordinal": 2, "label": "均衡", "order_fraction": 0.15, "daily_trade_cap": 5,
+     "daily_loss_pct": 0.05,
      "notes": "Moderate sizing, cash-only."},
     {"ordinal": 3, "label": "激进", "order_fraction": 0.30, "daily_trade_cap": 10,
+     "daily_loss_pct": 0.05,
      "notes": "Largest clips this account allows — still cash-only."},
 )
 
@@ -201,8 +204,16 @@ class ProposeMandateProfilesTool(BaseTool):
         ceil_exposure = float(ceil_exposure) if ceil_exposure is not None else funding
         ceil_daily = canon.get("max_trades_per_day")
         ceil_daily = int(ceil_daily) if ceil_daily is not None else None
+        ceil_loss = canon.get("max_daily_loss_pct")
+        ceil_loss = float(ceil_loss) if ceil_loss is not None else None
         instruments = list(canon.get("allowed_instruments") or ["equity"])
         universe = ceilings.get("universe") or ["AAPL", "MSFT", "NVDA", "GOOGL"]
+        # The permitted asset-class buckets come from the account ceiling
+        # snapshot. They default to us_equity, but a forex / crypto / cfd
+        # account must state its own buckets - without them every FX order
+        # is denied with "forex not in permitted asset_classes", because the
+        # mandate's universe defaults to us_equity.
+        asset_classes = list(ceilings.get("asset_classes") or ["us_equity"])
         # Leverage is always clamped to the ceiling; default cash-only.
         leverage = canon.get("leverage", "none")
 
@@ -223,13 +234,18 @@ class ProposeMandateProfilesTool(BaseTool):
             daily = tpl["daily_trade_cap"]
             if ceil_daily is not None:
                 daily = min(daily, ceil_daily)
+            daily_loss = tpl["daily_loss_pct"]
+            if ceil_loss is not None:
+                daily_loss = min(daily_loss, ceil_loss)
             profile = {
                 "ordinal": tpl["ordinal"],
                 "label": tpl["label"],
                 "universe": universe,
+                "asset_classes": list(asset_classes),
                 "max_order_usd": max_order,
                 "max_total_exposure_usd": ceil_exposure,
                 "daily_trade_cap": daily,
+                "max_daily_loss_pct": daily_loss,
                 "leverage": leverage,
                 "instruments": instruments,
                 "flatten_on_halt": flatten_on_halt,

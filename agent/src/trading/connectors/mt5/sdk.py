@@ -32,6 +32,7 @@ from src.trading.connectors.mt5.orders import (
 from src.trading.connectors.mt5.reads import (
     check_status,
     get_account_snapshot,
+    get_daily_deals,
     get_historical_bars,
     get_open_orders,
     get_positions,
@@ -58,6 +59,7 @@ __all__ = [
     "quantity_notional_usd",
     "check_status",
     "get_account_snapshot",
+    "get_daily_deals",
     "get_historical_bars",
     "get_open_orders",
     "get_positions",
